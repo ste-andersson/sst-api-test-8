@@ -1,374 +1,321 @@
-# sst-api-test-8 / app/main.py
-# FastAPI backend for live STT over WebSocket following SPEC.md.
-# Python 3.13 required by SPEC.
-import os
-from dotenv import load_dotenv
-load_dotenv(override=True)
+from __future__ import annotations
+
 import asyncio
 import json
-import base64
+import logging
+import os
+import re
 import time
-from typing import List, Dict, Any, Optional
+from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from starlette.websockets import WebSocketState
 
-# Observability store (in-memory)
-class Ring:
-    def __init__(self, maxlen: int = 50):
-        self.maxlen = maxlen
-        self.buf: List[Any] = []
+from .config import settings
+from .debug_store import store
+from .realtime_client import OpenAIRealtimeClient
 
-    def push(self, x: Any):
-        self.buf.append(x)
-        if len(self.buf) > self.maxlen:
-            self.buf = self.buf[-self.maxlen:]
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("stt")
 
-    def to_list(self) -> List[Any]:
-        return list(self.buf)
+app = FastAPI(title="stefan-api-test-7 – STT-backend (FastAPI + Realtime)")
 
-class Obs:
-    def __init__(self):
-        self.frontend_chunk_count = 0
-        self.frontend_chunk_sizes = Ring()
-        self.openai_chunk_count = 0
-        self.openai_chunk_sizes = Ring()
-        self.openai_text_deltas = Ring()
-        self.openai_text_finals = Ring()
-        self.frontend_text_events = Ring()
 
-    def reset(self):
-        self.__init__()
+# ----------------------- CORS -----------------------
+origins = []
+regex = None
+for part in [p.strip() for p in settings.cors_origins.split(",") if p.strip()]:
+    if "*" in part:
+        # översätt *.lovable.app => regex
+        escaped = re.escape(part).replace(r"\*\.", ".*")
+        regex = rf"https://{escaped}" if part.startswith("*.") else rf"{escaped}"
+    else:
+        origins.append(part)
 
-obs = Obs()
-
-def _get_allowed_origins():
-    env = os.getenv("ALLOWED_ORIGINS", "https://*.lovable.app,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173")
-    parts = [p.strip() for p in env.split(",") if p.strip()]
-    # Starlette supports allow_origin_regex for wildcard domain like *.lovable.app
-    regex = None
-    specific = []
-    for p in parts:
-        if p.startswith("https://*.") and p.count(".") >= 2:
-            # Convert https://*.lovable.app -> ^https://([a-zA-Z0-9-]+\.)*lovable\.app$
-            domain = p[len("https://*."):].replace(".", r"\.")
-            regex = rf"^https://([a-zA-Z0-9-]+\.)*{domain}$"
-        else:
-            specific.append(p)
-    return specific, regex
-
-app = FastAPI(title="sst-api-test-8")
-
-# CORS per SPEC
-_allow, _regex = _get_allowed_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allow,
-    allow_origin_regex=_regex,
+    allow_origins=origins,
+    allow_origin_regex=regex,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# --------------------- Models -----------------------
+class ConfigOut(BaseModel):
+    realtime_url: str
+    transcribe_model: str
+    input_language: str
+    commit_interval_ms: int
+    cors_origins: list[str]
+    cors_regex: Optional[str]
+
+class DebugListOut(BaseModel):
+    session_id: str
+    data: list
+
+# --------------------- Endpoints --------------------
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    return {"ok": True, "ts": time.time()}
 
-@app.get("/debug/frontend-chunks")
-async def debug_frontend_chunks():
-    return {
-        "count": obs.frontend_chunk_count,
-        "recent_sizes": obs.frontend_chunk_sizes.to_list(),
-    }
+@app.get("/config", response_model=ConfigOut)
+async def get_config():
+    return ConfigOut(
+        realtime_url=settings.realtime_url,
+        transcribe_model=settings.transcribe_model,
+        input_language=settings.input_language,
+        commit_interval_ms=settings.commit_interval_ms,
+        cors_origins=origins,
+        cors_regex=regex,
+    )
 
-@app.get("/debug/openai-chunks")
-async def debug_openai_chunks():
-    return {
-        "count": obs.openai_chunk_count,
-        "recent_sizes": obs.openai_chunk_sizes.to_list(),
-    }
+@app.get("/debug/frontend-chunks", response_model=DebugListOut)
+async def debug_frontend_chunks(session_id: str = Query(...), limit: int = Query(200, ge=1, le=1000)):
+    buf = store.get_or_create(session_id)
+    data = list(buf.frontend_chunks)[-limit:]
+    return DebugListOut(session_id=session_id, data=data)
 
-@app.get("/debug/openai-text")
-async def debug_openai_text():
-    return {
-        "deltas": obs.openai_text_deltas.to_list(),
-        "finals": obs.openai_text_finals.to_list(),
-    }
+@app.get("/debug/openai-chunks", response_model=DebugListOut)
+async def debug_openai_chunks(session_id: str = Query(...), limit: int = Query(200, ge=1, le=1000)):
+    buf = store.get_or_create(session_id)
+    data = list(buf.openai_chunks)[-limit:]
+    return DebugListOut(session_id=session_id, data=data)
 
-@app.get("/debug/frontend-text")
-async def debug_frontend_text():
-    return obs.frontend_text_events.to_list()
+@app.get("/debug/openai-text", response_model=DebugListOut)
+async def debug_openai_text(session_id: str = Query(...), limit: int = Query(200, ge=1, le=2000)):
+    buf = store.get_or_create(session_id)
+    data = list(buf.openai_text)[-limit:]
+    return DebugListOut(session_id=session_id, data=data)
+
+@app.get("/debug/frontend-text", response_model=DebugListOut)
+async def debug_frontend_text(session_id: str = Query(...), limit: int = Query(200, ge=1, le=2000)):
+    buf = store.get_or_create(session_id)
+    data = list(buf.frontend_text)[-limit:]
+    return DebugListOut(session_id=session_id, data=data)
+
+@app.get("/debug/rt-events", response_model=DebugListOut)
+async def debug_rt_events(session_id: str = Query(...), limit: int = Query(200, ge=1, le=2000)):
+    buf = store.get_or_create(session_id)
+    data = list(buf.rt_events)[-limit:]
+    return DebugListOut(session_id=session_id, data=data)
 
 @app.post("/debug/reset")
-async def debug_reset():
-    obs.reset()
-    return {"ok": True}
+async def debug_reset(session_id: str | None = Query(None)):
+    store.reset(session_id)
+    return {"ok": True, "session_id": session_id}
 
-# --- WebSocket <-> OpenAI Realtime bridge ---
-
-OPENAI_REALTIME_URL = os.getenv(
-    "OPENAI_REALTIME_URL",
-    "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17"
-)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-
-# VAD tuning from SPEC (defaults)
-SILENCE_MS = int(os.getenv("SILENCE_MS", "600"))  # 500–800 recommended
-PREFIX_PADDING_MS = int(os.getenv("PREFIX_PADDING_MS", "300"))
-SAMPLE_RATE = 16000
-
-async def _openai_ws_connect():
-    """
-    Connects to OpenAI Realtime WS with proper headers.
-    Returns the connected websocket object from the 'websockets' library.
-    """
-    import websockets
-    # Azure vs OpenAI headers
-    if ".openai.azure.com" in OPENAI_REALTIME_URL:
-        headers = [("api-key", OPENAI_API_KEY)]
-    else:
-        headers = [("Authorization", f"Bearer {OPENAI_API_KEY}")]
-        headers.append(("OpenAI-Beta", "realtime=v1"))
-    ws = await websockets.connect(
-        OPENAI_REALTIME_URL,
-        extra_headers=headers,
-        max_size=32 * 1024 * 1024,
-        ping_interval=10,
-        ping_timeout=10,
-    )
-    # Configure session for server_vad + pcm16 16k mono
-    session_update = {
-        "type": "session.update",
-        "session": {
-            "turn_detection": {
-                "type": "server_vad",
-                "silence_duration_ms": SILENCE_MS,
-                "prefix_padding_ms": PREFIX_PADDING_MS,
-                "threshold": 0.5,
-                "create_response": True,
-                "interrupt_response": True,
-            },
-            "input_audio_format": "pcm16",
-            "input_audio_transcription": {
-                "model": os.getenv("REALTIME_TRANSCRIBE_MODEL", "whisper-1"),
-                "language": os.getenv("INPUT_LANGUAGE", "sv"),
-            },
-            # Ensure transcription-only behavior
-            "modalities": ["text"],
-        },
-    }
-    await ws.send(json.dumps(session_update))
-    # Kick off a text-only response stream so transcripts are emitted
-    try:
-        await ws.send(json.dumps({
-            "type": "response.create",
-            "response": {
-                "conversation": "none",
-                "modalities": ["text"],
-                "instructions": "Transcribe the user's speech to text only. Do not speak back."
-            }
-        }))
-    except Exception:
-        pass
-
-    return ws
-
-def _extract_text_from_event(evt: Dict[str, Any]) -> Optional[str]:
-    """
-    Try to robustly pull text out of a variety of event payloads the
-    Realtime API may emit. The SPEC pinpoints
-    'conversation.item.input_audio_transcription.completed' for finals.
-    """
-    # Potential locations
-    for key in ["text", "transcript", "transcription", "output_text"]:
-        if isinstance(evt.get(key), str) and evt[key].strip():
-            return evt[key].strip()
-        if isinstance(evt.get("item", {}), dict):
-            v = evt["item"].get(key)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-            if isinstance(evt["item"].get("content"), list):
-                # Sometimes content is a list of blocks
-                for block in evt["item"]["content"]:
-                    if isinstance(block, dict):
-                        t = block.get("text") or block.get("transcript") or block.get("delta")
-                        if isinstance(t, str) and t.strip():
-                            return t.strip()
-    # Some delta events: evt.get("delta")
-    if isinstance(evt.get("delta"), str) and evt["delta"].strip():
-        return evt["delta"].strip()
-    # Nested in "transcription": {"text": ...}
-    if isinstance(evt.get("transcription"), dict):
-        t = evt["transcription"].get("text")
-        if isinstance(t, str) and t.strip():
-            return t.strip()
-    return None
-
-async def _pump_client_to_openai(client_ws: WebSocket, openai_ws):
-    """
-    Forward PCM16 frames from client to OpenAI using input_audio_buffer.append messages.
-    """
-    COMMIT_INTERVAL_MS = int(os.getenv("COMMIT_INTERVAL_MS", "500"))
-    last_commit = 0.0
-    
-    try:
-        while True:
-            data = await client_ws.receive_bytes()
-            size = len(data)
-            obs.frontend_chunk_count += 1
-            obs.frontend_chunk_sizes.push(size)
-
-            # forward as base64 in JSON per Realtime protocol
-            b64 = base64.b64encode(data).decode("ascii")
-            msg = {
-                "type": "input_audio_buffer.append",
-                "audio": b64,
-            }
-            await openai_ws.send(json.dumps(msg))
-            obs.openai_chunk_count += 1
-            obs.openai_chunk_sizes.push(size)
-
-            # Periodisk commit för att få deltas och finaler
-            now = time.time()
-            if (now - last_commit) * 1000 >= COMMIT_INTERVAL_MS:
-                try:
-                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                except Exception as e:
-                    # ignorera "buffer too small"/tom buffer
-                    s = str(e)
-                    if "buffer too small" not in s and "input_audio_buffer_commit_empty" not in s:
-                        raise
-                last_commit = now
-    except (WebSocketDisconnect, asyncio.CancelledError):
-        # Client or task cancelled/disconnected
-        pass
-    except Exception:
-        # Stop on any error; OpenAI side might continue until closed.
-        pass
-    finally:
-        # Commit the current buffer so VAD can finalize any trailing speech
-        try:
-            await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-        except Exception:
-            pass
-
-async def _pump_openai_to_client(openai_ws, client_ws: WebSocket):
-    """
-    Listen for transcription events and forward partials/finals.
-    """
-    # Throttle partials to avoid spamming
-    last_partial_sent_at = 0.0
-    partial_accum = ""
-
-    try:
-        while True:
-            msg = await openai_ws.recv()
-            if isinstance(msg, (bytes, bytearray)):
-                # Binary messages are not expected for transcript text here
-                continue
-            evt = json.loads(msg)
-
-            etype = evt.get("type", "")
-            # debug: record event types occasionally
-            try:
-                obs.frontend_text_events.push({"etype": etype})
-            except Exception:
-                pass
-            text = None
-            is_final = False
-            is_partial = False
-
-            # Heuristics for partial text delta events
-            if etype in (
-                "response.output_text.delta",          # common in Realtime
-                "response.audio_transcript.delta",
-                "transcription.delta",
-                "conversation.item.delta",
-            ):
-                text = _extract_text_from_event(evt)
-                is_partial = True
-
-            # Finals per SPEC event, plus a few common alternates
-            if etype in (
-                "conversation.item.input_audio_transcription.completed",
-                "transcription.completed",
-                "response.output_text.done",
-                "response.audio_transcript.completed",
-            ):
-                text = _extract_text_from_event(evt)
-                is_final = True
-
-            if is_partial and text:
-                partial_accum += text
-                now = time.time()
-                if now - last_partial_sent_at > 0.15:  # ~6/s
-                    payload = {"type": "stt.partial", "text": partial_accum}
-                    await client_ws.send_text(json.dumps(payload, ensure_ascii=False))
-                    obs.frontend_text_events.push(payload)
-                    obs.openai_text_deltas.push(text)
-                    last_partial_sent_at = now
-
-            if is_final and text:
-                payload = {"type": "stt.final", "text": text}
-                await client_ws.send_text(json.dumps(payload, ensure_ascii=False))
-                obs.frontend_text_events.push(payload)
-                obs.openai_text_finals.push(text)
-                # Reset accumulators after a turn completes
-                partial_accum = ""
-                last_partial_sent_at = 0.0
-    except (Exception, asyncio.CancelledError):
-        # Exit on any error/closure (graceful under 3.11+/3.13 where CancelledError is BaseException)
-        pass
-
+# --------------------- WebSocket --------------------
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(ws: WebSocket):
     await ws.accept()
-    # Handshake: must immediately send 'ready' per SPEC
-    ready = {
-        "type": "ready",
-        "audio_in": {"encoding": "pcm16", "sample_rate_hz": 16000, "channels": 1},
-    }
-    await ws.send_text(json.dumps(ready))
+    
+    # A är default: JSON, B som fallback: ren text
+    mode = (ws.query_params.get("mode") or os.getenv("WS_DEFAULT_MODE", "json")).lower()
+    send_json = (mode == "json")
+    
+    session_id = store.new_session()
+    
+    # Skicka "ready" meddelande för kompatibilitet med frontend
+    if send_json:
+        await ws.send_json({
+            "type": "ready",
+            "audio_in": {"encoding": "pcm16", "sample_rate_hz": 16000, "channels": 1},
+            "audio_out": {"mimetype": "audio/mpeg"},
+        })
+        await ws.send_json({"type": "session.started", "session_id": session_id})
 
-    if not OPENAI_API_KEY:
-        # Fail fast but keep the socket alive long enough for frontends to see 'ready'
-        # and possibly some helpful message.
-        await asyncio.sleep(0.1)
-        await ws.send_text(json.dumps({"type": "stt.final", "text": "OPENAI_API_KEY not configured"}))
-        return
-
-    # Connect to OpenAI Realtime
+    # Setup klient mot OpenAI/Azure Realtime
+    rt = OpenAIRealtimeClient(
+        url=settings.realtime_url,
+        api_key=settings.openai_api_key,
+        transcribe_model=settings.transcribe_model,
+        language=settings.input_language,
+        add_beta_header=settings.add_beta_header,
+    )
+    
     try:
-        openai_ws = await _openai_ws_connect()
+        await rt.connect()
     except Exception as e:
-        await ws.send_text(json.dumps({"type": "stt.final", "text": f"OpenAI Realtime connect failed: {e}"}))
+        if send_json and ws.client_state == WebSocketState.CONNECTED:
+            await ws.send_json({"type": "error", "reason": "realtime_connect_failed", "detail": str(e)})
         return
+    else:
+        if send_json and ws.client_state == WebSocketState.CONNECTED:
+            await ws.send_json({"type": "info", "msg": "realtime_connected"})
 
-    # Run pumps concurrently
-    pump_up = asyncio.create_task(_pump_client_to_openai(ws, openai_ws))
-    pump_down = asyncio.create_task(_pump_openai_to_client(openai_ws, ws))
+    buffers = store.get_or_create(session_id)
 
-    # Keep session until client disconnects
-    try:
-        done, pending = await asyncio.wait([pump_up, pump_down], return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        for task in done:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-    finally:
-        # Close OpenAI ws
+    # Hålla senaste text för enkel diff
+    last_text = ""
+    
+    # Flagga för att veta om vi har skickat ljud
+    has_audio = False
+    last_audio_time = 0  # Timestamp för senaste ljud
+
+    # Task: läs events från Realtime och skicka deltas till frontend
+    async def on_rt_event(evt: dict):
+        nonlocal last_text
+        t = evt.get("type")
+
+        # (A) logga alltid eventtyp för felsökning (/debug/rt-events om ni har det)
         try:
-            await openai_ws.close()
+            buffers.rt_events.append(str(t))
         except Exception:
             pass
-        # Cancel the other task
-        for t in (pump_up, pump_down):
-            if not t.done():
-                t.cancel()
-                try:
-                    await t
-                except Exception:
+
+        # (B) bubbla upp error/info till klienten (syns i browser-konsol)
+        if t == "error":
+            detail = evt.get("error", evt)
+            if send_json and ws.client_state == WebSocketState.CONNECTED:
+                await ws.send_json({"type": "error", "reason": "realtime_error", "detail": detail})
+            return
+        if t == "session.updated":
+            if send_json and ws.client_state == WebSocketState.CONNECTED:
+                await ws.send_json({"type": "info", "msg": "realtime_connected_and_configured"})
+            return
+
+        # (C) försök extrahera transcript från flera varianter
+        transcript = None
+
+        # 1) Klassisk Realtime-transkript (som repo 2 använder) - whisper-1 + server VAD
+        if t == "conversation.item.input_audio_transcription.completed":
+            transcript = (
+                evt.get("transcript")
+                or evt.get("item", {}).get("content", [{}])[0].get("transcript")
+            )
+
+        # 2) Alternativ nomenklatur: response.audio_transcript.delta/completed
+        if not transcript and t in ("response.audio_transcript.delta", "response.audio_transcript.completed"):
+            transcript = evt.get("transcript") or evt.get("text") or evt.get("delta")
+
+        # 3) Sista fallback: response.output_text.delta (text-delning)
+        if not transcript and t == "response.output_text.delta":
+            delta_txt = evt.get("delta")
+            if isinstance(delta_txt, str):
+                transcript = (last_text or "") + delta_txt
+
+        if not isinstance(transcript, str) or not transcript:
+            return
+
+        # (D) beräkna delta och skicka till frontend
+        delta = transcript[len(last_text):] if transcript.startswith(last_text) else transcript
+
+        if delta and ws.client_state == WebSocketState.CONNECTED:
+            buffers.openai_text.append(transcript)
+            
+            # Bestäm om detta är final eller partial transcript
+            is_final = t in (
+                "conversation.item.input_audio_transcription.completed",
+                "response.audio_transcript.completed",
+            )
+            
+            if send_json:
+                await ws.send_json({
+                    "type": "stt.final" if is_final else "stt.partial",
+                    "text": transcript
+                })
+            else:
+                await ws.send_text(delta)  # fallback: ren text
+            buffers.frontend_text.append(delta)
+            last_text = transcript
+
+    rt_recv_task = asyncio.create_task(rt.recv_loop(on_rt_event))
+
+    # Periodisk commit för att få löpande partials
+    async def commit_loop():
+        try:
+            while True:
+                await asyncio.sleep(max(0.001, settings.commit_interval_ms / 1000))
+                # Bara committa om vi har skickat ljud
+                if has_audio:
+                    # Kontrollera om det har gått för lång tid sedan senaste ljudet
+                    import time
+                    if time.time() - last_audio_time > 2.0:  # 2 sekunder timeout
+                        has_audio = False
+                        log.debug("Timeout - återställer has_audio flaggan")
+                        continue
+                    
+                    try:
+                        await rt.commit()
+                    except Exception as e:
+                        # Hantera "buffer too small" fel mer elegant
+                        if "buffer too small" in str(e) or "input_audio_buffer_commit_empty" in str(e):
+                            log.debug("Buffer för liten, väntar på mer ljud: %s", e)
+                            # Om buffern är helt tom, återställ has_audio flaggan
+                            if "0.00ms of audio" in str(e):
+                                has_audio = False
+                            continue  # Fortsätt loopen istället för att bryta
+                        else:
+                            log.warning("Commit fel: %s", e)
+                            break
+        except asyncio.CancelledError:
+            pass
+
+    commit_task = asyncio.create_task(commit_loop())
+
+    try:
+        while ws.client_state == WebSocketState.CONNECTED:
+            try:
+                msg = await ws.receive()
+
+                if "bytes" in msg and msg["bytes"] is not None:
+                    chunk = msg["bytes"]
+                    buffers.frontend_chunks.append(len(chunk))
+                    try:
+                        await rt.send_audio_chunk(chunk)
+                        buffers.openai_chunks.append(len(chunk))
+                        has_audio = True  # Markera att vi har skickat ljud
+                        import time
+                        last_audio_time = time.time()  # Uppdatera timestamp
+                    except Exception as e:
+                        log.error("Fel när chunk skickades till Realtime: %s", e)
+                        break
+                elif "text" in msg and msg["text"] is not None:
+                    # Tillåt ping/ctrl meddelanden som sträng
+                    if msg["text"] == "ping":
+                        await ws.send_text("pong")
+                    else:
+                        # ignoreras
+                        pass
+                else:
+                    # okänt format
                     pass
+
+            except WebSocketDisconnect:
+                log.info("WebSocket stängd: %s", session_id)
+                break
+            except RuntimeError as e:
+                log.info("WS disconnect during receive(): %s", e)
+                break
+            except Exception as e:
+                log.error("WebSocket fel: %s", e)
+                break
+    finally:
+        commit_task.cancel()
+        rt_recv_task.cancel()
+        try:
+            await rt.close()
+        except Exception:
+            pass
+        try:
+            await asyncio.gather(commit_task, rt_recv_task, return_exceptions=True)
+        except Exception:
+            pass
+        # Stäng WebSocket bara om den inte redan är stängd
+        if ws.client_state != WebSocketState.DISCONNECTED:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+
+# Alias route för /ws som använder samma logik som /ws/transcribe
+@app.websocket("/ws")
+async def ws_alias(ws: WebSocket):
+    # Återanvänd exakt samma logik som i ws_transcribe
+    await ws_transcribe(ws)
