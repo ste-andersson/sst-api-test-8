@@ -106,7 +106,10 @@ async def debug_reset():
 
 # --- WebSocket <-> OpenAI Realtime bridge ---
 
-OPENAI_REALTIME_URL = os.getenv("OPENAI_REALTIME_URL", "wss://api.openai.com/v1/realtime?model=whisper-1")
+OPENAI_REALTIME_URL = os.getenv(
+    "OPENAI_REALTIME_URL",
+    "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17"
+)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # VAD tuning from SPEC (defaults)
@@ -120,14 +123,16 @@ async def _openai_ws_connect():
     Returns the connected websocket object from the 'websockets' library.
     """
     import websockets
-    headers = [
-        ("Authorization", f"Bearer {OPENAI_API_KEY}"),
-        ("OpenAI-Beta", "realtime=v1"),
-    ]
+    # Azure vs OpenAI headers
+    if ".openai.azure.com" in OPENAI_REALTIME_URL:
+        headers = [("api-key", OPENAI_API_KEY)]
+    else:
+        headers = [("Authorization", f"Bearer {OPENAI_API_KEY}")]
+        headers.append(("OpenAI-Beta", "realtime=v1"))
     ws = await websockets.connect(
         OPENAI_REALTIME_URL,
-        additional_headers=headers,
-        max_size=8 * 1024 * 1024,
+        extra_headers=headers,
+        max_size=32 * 1024 * 1024,
         ping_interval=10,
         ping_timeout=10,
     )
@@ -139,11 +144,17 @@ async def _openai_ws_connect():
                 "type": "server_vad",
                 "silence_duration_ms": SILENCE_MS,
                 "prefix_padding_ms": PREFIX_PADDING_MS,
+                "create_response": False,
+                "interrupt_response": True,
             },
             "input_audio_format": {
                 "type": "pcm16",
                 "sample_rate_hz": SAMPLE_RATE,
                 "channels": 1,
+            },
+            "input_audio_transcription": {
+                "model": os.getenv("REALTIME_TRANSCRIBE_MODEL", "whisper-1"),
+                "language": os.getenv("INPUT_LANGUAGE", "sv"),
             },
             # Ensure transcription-only behavior
             "modalities": ["text"],
@@ -187,6 +198,9 @@ async def _pump_client_to_openai(client_ws: WebSocket, openai_ws):
     """
     Forward PCM16 frames from client to OpenAI using input_audio_buffer.append messages.
     """
+    COMMIT_INTERVAL_MS = int(os.getenv("COMMIT_INTERVAL_MS", "500"))
+    last_commit = 0.0
+    
     try:
         while True:
             data = await client_ws.receive_bytes()
@@ -203,6 +217,18 @@ async def _pump_client_to_openai(client_ws: WebSocket, openai_ws):
             await openai_ws.send(json.dumps(msg))
             obs.openai_chunk_count += 1
             obs.openai_chunk_sizes.push(size)
+
+            # Periodisk commit för att få deltas och finaler
+            now = time.time()
+            if (now - last_commit) * 1000 >= COMMIT_INTERVAL_MS:
+                try:
+                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                except Exception as e:
+                    # ignorera "buffer too small"/tom buffer
+                    s = str(e)
+                    if "buffer too small" not in s and "input_audio_buffer_commit_empty" not in s:
+                        raise
+                last_commit = now
     except WebSocketDisconnect:
         # Client disconnected
         pass
