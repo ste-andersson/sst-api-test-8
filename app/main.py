@@ -145,7 +145,7 @@ async def _openai_ws_connect():
                 "silence_duration_ms": SILENCE_MS,
                 "prefix_padding_ms": PREFIX_PADDING_MS,
                 "threshold": 0.5,
-                "create_response": False,
+                "create_response": True,
                 "interrupt_response": True,
             },
             "input_audio_format": "pcm16",
@@ -158,6 +158,19 @@ async def _openai_ws_connect():
         },
     }
     await ws.send(json.dumps(session_update))
+    # Kick off a text-only response stream so transcripts are emitted
+    try:
+        await ws.send(json.dumps({
+            "type": "response.create",
+            "response": {
+                "conversation": "none",
+                "modalities": ["text"],
+                "instructions": "Transcribe the user's speech to text only. Do not speak back."
+            }
+        }))
+    except Exception:
+        pass
+
     return ws
 
 def _extract_text_from_event(evt: Dict[str, Any]) -> Optional[str]:
