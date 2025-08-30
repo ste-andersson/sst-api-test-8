@@ -147,11 +147,7 @@ async def _openai_ws_connect():
                 "create_response": False,
                 "interrupt_response": True,
             },
-            "input_audio_format": {
-                "type": "pcm16",
-                "sample_rate_hz": SAMPLE_RATE,
-                "channels": 1,
-            },
+            "input_audio_format": "pcm16",
             "input_audio_transcription": {
                 "model": os.getenv("REALTIME_TRANSCRIBE_MODEL", "whisper-1"),
                 "language": os.getenv("INPUT_LANGUAGE", "sv"),
@@ -181,7 +177,7 @@ def _extract_text_from_event(evt: Dict[str, Any]) -> Optional[str]:
                 # Sometimes content is a list of blocks
                 for block in evt["item"]["content"]:
                     if isinstance(block, dict):
-                        t = block.get("text")
+                        t = block.get("text") or block.get("transcript") or block.get("delta")
                         if isinstance(t, str) and t.strip():
                             return t.strip()
     # Some delta events: evt.get("delta")
@@ -229,8 +225,8 @@ async def _pump_client_to_openai(client_ws: WebSocket, openai_ws):
                     if "buffer too small" not in s and "input_audio_buffer_commit_empty" not in s:
                         raise
                 last_commit = now
-    except WebSocketDisconnect:
-        # Client disconnected
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        # Client or task cancelled/disconnected
         pass
     except Exception:
         # Stop on any error; OpenAI side might continue until closed.
@@ -259,6 +255,11 @@ async def _pump_openai_to_client(openai_ws, client_ws: WebSocket):
             evt = json.loads(msg)
 
             etype = evt.get("type", "")
+            # debug: record event types occasionally
+            try:
+                obs.openai_text_events.push({"etype": etype})
+            except Exception:
+                pass
             text = None
             is_final = False
             is_partial = False
@@ -266,6 +267,7 @@ async def _pump_openai_to_client(openai_ws, client_ws: WebSocket):
             # Heuristics for partial text delta events
             if etype in (
                 "response.output_text.delta",          # common in Realtime
+                "response.audio_transcript.delta",
                 "transcription.delta",
                 "conversation.item.delta",
             ):
@@ -277,6 +279,7 @@ async def _pump_openai_to_client(openai_ws, client_ws: WebSocket):
                 "conversation.item.input_audio_transcription.completed",
                 "transcription.completed",
                 "response.output_text.done",
+                "response.audio_transcript.completed",
             ):
                 text = _extract_text_from_event(evt)
                 is_final = True
@@ -299,8 +302,8 @@ async def _pump_openai_to_client(openai_ws, client_ws: WebSocket):
                 # Reset accumulators after a turn completes
                 partial_accum = ""
                 last_partial_sent_at = 0.0
-    except Exception:
-        # Exit on any error/closure
+    except (Exception, asyncio.CancelledError):
+        # Exit on any error/closure (graceful under 3.11+/3.13 where CancelledError is BaseException)
         pass
 
 @app.websocket("/ws/transcribe")
@@ -333,7 +336,14 @@ async def ws_transcribe(ws: WebSocket):
 
     # Keep session until client disconnects
     try:
-        await asyncio.wait([pump_up, pump_down], return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait([pump_up, pump_down], return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in done:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     finally:
         # Close OpenAI ws
         try:
