@@ -144,6 +144,7 @@ async def _openai_ws_connect():
                 "type": "server_vad",
                 "silence_duration_ms": SILENCE_MS,
                 "prefix_padding_ms": PREFIX_PADDING_MS,
+                "threshold": 0.5,
                 "create_response": False,
                 "interrupt_response": True,
             },
@@ -257,7 +258,7 @@ async def _pump_openai_to_client(openai_ws, client_ws: WebSocket):
             etype = evt.get("type", "")
             # debug: record event types occasionally
             try:
-                obs.openai_text_events.push({"etype": etype})
+                obs.frontend_text_events.push({"etype": etype})
             except Exception:
                 pass
             text = None
